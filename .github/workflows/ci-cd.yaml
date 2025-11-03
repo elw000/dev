@@ -1,0 +1,120 @@
+name: CI/CD Pipeline
+
+# متى يشتغل الـ workflow
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+# متغيرات عامة
+env:
+  DOCKER_IMAGE: hello-python
+  DOCKER_TAG: ${{ github.sha }}
+  K8S_DEPLOYMENT: hello-deployment
+
+jobs:
+  # المرحلة 1: بناء واختبار
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+    # 1. جلب الكود
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    # 2. إعداد Python
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.9'
+    
+    # 3. تثبيت المكتبات
+    - name: Install dependencies
+      run: |
+        cd application/python
+        pip install -r requirements.txt
+    
+    # 4. اختبار الكود
+    - name: Run tests
+      run: |
+        cd application/python
+        pytest tests/ -v --cov=app --cov-report=term-missing
+    
+    # 5. بناء Docker Image
+    - name: Build Docker Image
+      run: |
+        cd application/python
+        docker build -t ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} .
+        docker tag ${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} ${{ env.DOCKER_IMAGE }}:latest
+    
+    # 6. اختبار الـ Docker Image
+    - name: Test Docker Image
+      run: |
+        # شغل container للاختبار
+        docker run -d -p 8080:8080 --name test-container ${{ env.DOCKER_IMAGE }}:latest
+        sleep 5
+        # اختبر إن التطبيق شغال
+        curl -f http://localhost:8080 || exit 1
+        docker stop test-container
+        docker rm test-container
+    
+    # 7. تسجيل الدخول لـ Docker Hub
+    - name: Login to Docker Hub
+      if: github.event_name == 'push'
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKER_USERNAME }}
+        password: ${{ secrets.DOCKER_PASSWORD }}
+    
+    # 8. رفع الصورة لـ Docker Hub
+    - name: Push to Docker Hub
+      if: github.event_name == 'push'
+      run: |
+        docker tag ${{ env.DOCKER_IMAGE }}:latest ${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+        docker tag ${{ env.DOCKER_IMAGE }}:latest ${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest
+        docker push ${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }}
+        docker push ${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:latest
+
+  # المرحلة 2: النشر على Kubernetes
+  deploy:
+    name: Deploy to Kubernetes
+    needs: build-and-test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    
+    steps:
+    # 1. جلب الكود
+    - name: Checkout code
+      uses: actions/checkout@v4
+    
+    # 2. إعداد kubectl
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v4
+      with:
+        version: 'latest'
+    
+    # 3. إعداد Kubeconfig (للاتصال بالـ cluster)
+    - name: Configure kubectl
+      run: |
+        mkdir -p $HOME/.kube
+        echo "${{ secrets.KUBE_CONFIG }}" | base64 -d > $HOME/.kube/config
+    
+    # 4. تحديث الـ Deployment
+    - name: Update Kubernetes Deployment
+      run: |
+        # تحديث الصورة في الـ deployment
+        kubectl set image deployment/${{ env.K8S_DEPLOYMENT }} \
+          hello=${{ secrets.DOCKER_USERNAME }}/${{ env.DOCKER_IMAGE }}:${{ env.DOCKER_TAG }} \
+          --record
+        
+        # انتظار اكتمال الـ rollout
+        kubectl rollout status deployment/${{ env.K8S_DEPLOYMENT }}
+    
+    # 5. التحقق من الـ Deployment
+    - name: Verify Deployment
+      run: |
+        kubectl get pods
+        kubectl get services
+        echo "✅ Deployment completed successfully!"
